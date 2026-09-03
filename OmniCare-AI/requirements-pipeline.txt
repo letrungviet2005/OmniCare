@@ -1,0 +1,4 @@
+# Dependencies for the one-video local pipeline.
+-r voice_detection/requirements.txt
+ultralytics>=8.3,<9
+mediapipe>=0.10,<1

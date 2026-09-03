@@ -1,0 +1,86 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Python tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==============================
+# Node.js / Frontend
+# ==============================
+node_modules/
+**/node_modules/
+
+dist/
+**/dist/
+
+.npm/
+.yarn/
+.pnpm-store/
+
+*.log
+
+# ==============================
+# Java / Maven
+# ==============================
+target/
+**/target/
+
+*.class
+
+# ==============================
+# IDE
+# ==============================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+.idea/
+*.iml
+
+# ==============================
+# OS
+# ==============================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# Environment / Secrets
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Python / AI temporary files
+# ==============================
+*.tmp
+*.temp
+
+# ==============================
+# Test / generated outputs
+# ==============================
+screenshots/
+**/screenshots/
+
+temp/
+**/temp/
+
+output/
+**/output/
