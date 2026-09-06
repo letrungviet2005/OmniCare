@@ -1,11 +1,13 @@
 """Fast wiring tests; they do not need OpenCV, FFmpeg, or model weights."""
 
 import importlib.util
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,8 +15,10 @@ AI_ROOT = ROOT / "OmniCare-AI"
 if str(AI_ROOT) not in sys.path:
     sys.path.insert(0, str(AI_ROOT))
 
-from fall_detection.pipeline import FallAnalysis
-from voice_detection.pipeline import VoiceAnalysis
+from common.video_input import VideoMetadata
+from fall_detection.pipeline import FallAnalysis, FallEvent, FallPipeline
+from voice_detection.audio_extractor import AudioExtractionError, AudioExtractor
+from voice_detection.pipeline import VoiceAnalysis, VoicePipeline
 from voice_detection.speech_recognizer import TranscriptSegment
 
 
@@ -40,6 +44,22 @@ class SharedVideoContractTest(unittest.TestCase):
                 Path(wav_path).write_bytes(b"temporary test audio")
                 return wav_path
 
+        class FakeVideoInput:
+            def __init__(self, video_path):
+                self.path = Path(video_path).expanduser().resolve()
+
+            @property
+            def source_id(self):
+                return str(self.path)
+
+            def validate_file(self):
+                if not self.path.is_file():
+                    raise AssertionError("Test video placeholder was not created")
+                return self
+
+            def metadata(self):
+                return VideoMetadata(30.0, 303, 10.1, 720, 1280)
+
         class FakeVoicePipeline:
             def __init__(self, **_kwargs):
                 pass
@@ -61,9 +81,11 @@ class SharedVideoContractTest(unittest.TestCase):
                 return FallAnalysis(source.source_id, 1, [])
 
         original_extractor = runner.AudioExtractor
+        original_video_input = runner.VideoInput
         original_voice = runner.VoicePipeline
         original_fall = runner.FallPipeline
         runner.AudioExtractor = FakeExtractor
+        runner.VideoInput = FakeVideoInput
         runner.VoicePipeline = FakeVoicePipeline
         runner.FallPipeline = FakeFallPipeline
         try:
@@ -82,6 +104,7 @@ class SharedVideoContractTest(unittest.TestCase):
                 )
         finally:
             runner.AudioExtractor = original_extractor
+            runner.VideoInput = original_video_input
             runner.VoicePipeline = original_voice
             runner.FallPipeline = original_fall
 
@@ -93,6 +116,111 @@ class SharedVideoContractTest(unittest.TestCase):
         self.assertEqual(result["modules"]["conversation"]["input_video"], source_id)
         self.assertEqual(result["modules"]["conversation"]["events"][0]["start"], 155.0)
         self.assertEqual(result["modules"]["conversation"]["events"][0]["end"], 158.0)
+        self.assertEqual(result["modules"]["conversation"]["events"][0]["timestamp"], 155.0)
+        self.assertEqual(result["duration"], 10.1)
+        self.assertEqual(result["events"][0]["source"], "conversation")
+        self.assertEqual(result["events"][0]["type"], "CONVERSATION_SEGMENT")
+        self.assertEqual(result["events"][0]["timestamp"], 155.0)
+
+    def test_voice_events_only_include_detected_emergency_phrases(self):
+        class FakeRecognizer:
+            def __init__(self, **_kwargs):
+                pass
+
+            def transcribe(self, _audio_path, language):
+                self.language = language
+                return [
+                    TranscriptSegment(0.5, 1.5, "Hôm nay trời đẹp"),
+                    TranscriptSegment(2.5, 3.5, "Làm ơn giúp tôi"),
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            wav_path = Path(directory) / "shared.wav"
+            wav_path.write_bytes(b"test audio placeholder")
+            with patch("voice_detection.pipeline.SpeechRecognizer", FakeRecognizer):
+                result = VoicePipeline(language="vi").analyze(
+                    SimpleNamespace(source_id="shared.mp4"), wav_path
+                )
+
+        self.assertEqual(len(result.transcript_segments), 2)
+        self.assertEqual(len(result.events), 1)
+        self.assertEqual(result.events[0].timestamp, 2.5)
+        self.assertEqual(result.events[0].type, "HELP_REQUEST")
+        self.assertEqual(result.events[0].text, "Làm ơn giúp tôi")
+
+    def test_audio_extraction_timeout_is_reported_and_partial_output_removed(self):
+        extractor = AudioExtractor(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "shared.wav"
+            with patch(
+                "voice_detection.audio_extractor.subprocess.run",
+                side_effect=subprocess.TimeoutExpired("ffmpeg", 120),
+            ):
+                with self.assertRaisesRegex(
+                    AudioExtractionError, "audio extraction timed out"
+                ):
+                    extractor.extract("shared.mp4", output)
+            self.assertFalse(output.exists())
+
+    def test_video_without_audio_has_component_specific_error(self):
+        extractor = AudioExtractor(ffmpeg_path="ffmpeg", ffprobe_path="ffprobe")
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "silent.mp4"
+            video_path.write_bytes(b"test video placeholder")
+            with patch.object(extractor, "has_audio_stream", return_value=False):
+                with self.assertRaisesRegex(
+                    AudioExtractionError,
+                    "Voice Detection and Conversation require an audio stream",
+                ):
+                    extractor.validate_video(video_path)
+
+    def test_fall_event_exposes_video_timestamp_and_type(self):
+        event = FallEvent(3.42, 90, 81.0, 0.91).to_dict()
+        self.assertEqual(event["timestamp"], 3.42)
+        self.assertEqual(event["type"], "FALL_DETECTED")
+        self.assertEqual(event["confidence"], 0.91)
+
+    def test_scored_horizontal_fall_candidate_generates_one_timed_event(self):
+        import numpy as np
+
+        pipeline = FallPipeline.__new__(FallPipeline)
+        pipeline._previous_status = "NORMAL"
+        pipeline._fall_event_emitted = False
+        pipeline.person_detector = SimpleNamespace(
+            detect=lambda _frame: [{"bbox": (0, 0, 130, 100), "conf": 0.91}]
+        )
+        pose_landmarks = SimpleNamespace(
+            landmark=[SimpleNamespace(x=0.4, y=0.7), SimpleNamespace(x=0.6, y=0.7)]
+        )
+        pipeline.pose_detector = SimpleNamespace(
+            detect=lambda _frame: SimpleNamespace(pose_landmarks=pose_landmarks),
+            drawer=SimpleNamespace(draw_landmarks=lambda *_args: None),
+            mp_pose=SimpleNamespace(
+                POSE_CONNECTIONS=(),
+                PoseLandmark=SimpleNamespace(LEFT_HIP=0, RIGHT_HIP=1),
+            ),
+        )
+        pipeline.motion_analyzer = SimpleNamespace(
+            update=lambda _x, _y: {"distance": 0.01, "velocity": 0.01, "still": False}
+        )
+        pipeline.fall_detector = SimpleNamespace(
+            body_angle=lambda _landmarks: 132.0,
+            detect=lambda _angle, _bbox, _motion: {
+                "score": 85,
+                "state": "FALLING",
+                "angle_speed": 37.0,
+                "ratio": 1.46,
+            },
+        )
+        frame = np.zeros((100, 130, 3), dtype=np.uint8)
+
+        first = pipeline.process_frame(frame, 177 / 30)
+        second = pipeline.process_frame(frame, 178 / 30)
+
+        self.assertIsNotNone(first.event)
+        self.assertEqual(first.event.timestamp, 5.9)
+        self.assertEqual(first.event.trigger, "score_and_horizontal_bbox")
+        self.assertIsNone(second.event)
 
 
 if __name__ == "__main__":

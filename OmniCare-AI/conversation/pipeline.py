@@ -3,10 +3,17 @@
 from dataclasses import asdict, dataclass
 
 
+class ConversationPipelineError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class ConversationEvent:
+    timestamp: float
     start: float
     end: float
+    type: str
+    text: str
     transcript: str
 
     def to_dict(self):
@@ -31,8 +38,11 @@ class ConversationPipeline:
     def analyze(self, video_input, transcript_segments):
         events = [
             ConversationEvent(
+                timestamp=float(segment.start),
                 start=float(segment.start),
                 end=float(segment.end),
+                type="CONVERSATION_SEGMENT",
+                text=segment.text,
                 transcript=segment.text,
             )
             for segment in transcript_segments

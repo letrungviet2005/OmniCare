@@ -1,0 +1,2 @@
+# Dependencies for the local one-video OmniCare AI pipeline.
+-r OmniCare-AI/requirements-pipeline.txt
