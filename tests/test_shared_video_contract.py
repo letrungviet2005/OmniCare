@@ -16,7 +16,14 @@ if str(AI_ROOT) not in sys.path:
     sys.path.insert(0, str(AI_ROOT))
 
 from common.video_input import VideoMetadata
-from fall_detection.pipeline import FallAnalysis, FallEvent, FallPipeline
+from fall_detection.pipeline import (
+    FALL_EVENT_BBOX_RATIO_THRESHOLD,
+    FALL_EVENT_REARM_SECONDS,
+    FALL_EVENT_SCORE_THRESHOLD,
+    FallAnalysis,
+    FallEvent,
+    FallPipeline,
+)
 from voice_detection.audio_extractor import AudioExtractionError, AudioExtractor
 from voice_detection.pipeline import VoiceAnalysis, VoicePipeline
 from voice_detection.speech_recognizer import TranscriptSegment
@@ -206,10 +213,10 @@ class SharedVideoContractTest(unittest.TestCase):
         pipeline.fall_detector = SimpleNamespace(
             body_angle=lambda _landmarks: 132.0,
             detect=lambda _angle, _bbox, _motion: {
-                "score": 85,
+                "score": 70,
                 "state": "FALLING",
                 "angle_speed": 37.0,
-                "ratio": 1.46,
+                "ratio": 1.16,
             },
         )
         frame = np.zeros((100, 130, 3), dtype=np.uint8)
@@ -221,6 +228,104 @@ class SharedVideoContractTest(unittest.TestCase):
         self.assertEqual(first.event.timestamp, 5.9)
         self.assertEqual(first.event.trigger, "score_and_horizontal_bbox")
         self.assertIsNone(second.event)
+
+    def test_fall_fallback_and_rearm_configuration(self):
+        self.assertEqual(FALL_EVENT_SCORE_THRESHOLD, 70)
+        self.assertEqual(FALL_EVENT_BBOX_RATIO_THRESHOLD, 1.15)
+        self.assertEqual(FALL_EVENT_REARM_SECONDS, 4.0)
+
+    def test_legacy_terminal_fall_state_generates_one_timed_event(self):
+        import numpy as np
+
+        pipeline = FallPipeline.__new__(FallPipeline)
+        pipeline._previous_status = "LYING"
+        pipeline._fall_event_emitted = False
+        pipeline.person_detector = SimpleNamespace(
+            detect=lambda _frame: [{"bbox": (0, 0, 90, 120), "conf": 0.88}]
+        )
+        pose_landmarks = SimpleNamespace(
+            landmark=[SimpleNamespace(x=0.4, y=0.7), SimpleNamespace(x=0.6, y=0.7)]
+        )
+        pipeline.pose_detector = SimpleNamespace(
+            detect=lambda _frame: SimpleNamespace(pose_landmarks=pose_landmarks),
+            drawer=SimpleNamespace(draw_landmarks=lambda *_args: None),
+            mp_pose=SimpleNamespace(
+                POSE_CONNECTIONS=(),
+                PoseLandmark=SimpleNamespace(LEFT_HIP=0, RIGHT_HIP=1),
+            ),
+        )
+        pipeline.motion_analyzer = SimpleNamespace(
+            update=lambda _x, _y: {"distance": 0.0, "velocity": 0.0, "still": True}
+        )
+        pipeline.fall_detector = SimpleNamespace(
+            body_angle=lambda _landmarks: 78.0,
+            detect=lambda _angle, _bbox, _motion: {
+                "score": 55,
+                "state": "FALL",
+                "angle_speed": 0.0,
+                "ratio": 0.75,
+            },
+        )
+        frame = np.zeros((120, 90, 3), dtype=np.uint8)
+
+        first = pipeline.process_frame(frame, 12.5)
+        second = pipeline.process_frame(frame, 12.6)
+
+        self.assertEqual(first.status, "FALL")
+        self.assertIsNotNone(first.event)
+        self.assertEqual(first.event.timestamp, 12.5)
+        self.assertEqual(first.event.trigger, "temporal_state")
+        self.assertIsNone(second.event)
+
+    def test_fall_event_rearms_after_four_observed_normal_seconds(self):
+        import numpy as np
+
+        detector_results = iter(
+            [
+                {"score": 55, "state": "FALL", "angle_speed": 0.0, "ratio": 0.75},
+                {"score": 55, "state": "FALL", "angle_speed": 0.0, "ratio": 0.75},
+                {"score": 0, "state": "NORMAL", "angle_speed": 0.0, "ratio": 0.75},
+                {"score": 0, "state": "NORMAL", "angle_speed": 0.0, "ratio": 0.75},
+                {"score": 0, "state": "NORMAL", "angle_speed": 0.0, "ratio": 0.75},
+                {"score": 55, "state": "FALL", "angle_speed": 0.0, "ratio": 0.75},
+            ]
+        )
+        pipeline = FallPipeline.__new__(FallPipeline)
+        pipeline._previous_status = "NORMAL"
+        pipeline._fall_event_emitted = False
+        pipeline._normal_since = None
+        pipeline.person_detector = SimpleNamespace(
+            detect=lambda _frame: [{"bbox": (0, 0, 90, 120), "conf": 0.88}]
+        )
+        pose_landmarks = SimpleNamespace(
+            landmark=[SimpleNamespace(x=0.4, y=0.7), SimpleNamespace(x=0.6, y=0.7)]
+        )
+        pipeline.pose_detector = SimpleNamespace(
+            detect=lambda _frame: SimpleNamespace(pose_landmarks=pose_landmarks),
+            drawer=SimpleNamespace(draw_landmarks=lambda *_args: None),
+            mp_pose=SimpleNamespace(
+                POSE_CONNECTIONS=(),
+                PoseLandmark=SimpleNamespace(LEFT_HIP=0, RIGHT_HIP=1),
+            ),
+        )
+        pipeline.motion_analyzer = SimpleNamespace(
+            update=lambda _x, _y: {"distance": 0.0, "velocity": 0.0, "still": True}
+        )
+        pipeline.fall_detector = SimpleNamespace(
+            body_angle=lambda _landmarks: 78.0,
+            detect=lambda _angle, _bbox, _motion: next(detector_results),
+        )
+        frame = np.zeros((120, 90, 3), dtype=np.uint8)
+
+        results = [
+            pipeline.process_frame(frame, timestamp)
+            for timestamp in (10.0, 10.1, 20.0, 23.9, 24.0, 25.0)
+        ]
+
+        self.assertIsNotNone(results[0].event)
+        self.assertTrue(all(result.event is None for result in results[1:5]))
+        self.assertIsNotNone(results[5].event)
+        self.assertEqual(results[5].event.timestamp, 25.0)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 # Dependencies for the one-video local pipeline.
 -r voice_detection/requirements.txt
+-r conversation/requirements.txt
 ultralytics>=8.3,<9
 # Keep the base OpenCV wheel on the same supported major as the contrib wheel.
 opencv-python>=4.8,<5
