@@ -31,6 +31,7 @@ if str(BACKEND_ROOT) not in sys.path:
 from common.camera_input import CameraInput, CameraInputError
 from common.video_input import VideoInput, VideoInputError
 from conversation.pipeline import ConversationPipeline, ConversationPipelineError
+from conversation.provider_factory import ConversationProviderConfigurationError
 from conversation.worker import ConversationWorker
 from alert_engine import AlertEngine, AlertEngineError
 from event_engine import EventEngine, EventEngineError
@@ -874,11 +875,22 @@ def run_camera_monitor(args):
                 args.backend_url, args.token
             ).start()
         if getattr(args, "conversation", False):
-            conversation_worker = ConversationWorker().start()
-            LOGGER.info(
-                "Conversation AI enabled (%s).",
-                conversation_worker.conversation.model,
-            )
+            try:
+                conversation_worker = ConversationWorker().start()
+            except ConversationProviderConfigurationError as exc:
+                LOGGER.warning(
+                    "Conversation AI disabled: %s Continuing without LLM responses.",
+                    exc,
+                )
+            else:
+                provider = getattr(
+                    conversation_worker.conversation, "provider", None
+                )
+                LOGGER.info(
+                    "Conversation AI enabled (%s/%s).",
+                    getattr(provider, "name", "injected"),
+                    conversation_worker.conversation.model,
+                )
         if getattr(args, "audio", False):
             try:
                 voice_pipeline = VoicePipeline(

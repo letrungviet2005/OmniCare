@@ -22,15 +22,22 @@ import run_ai
 from conversation import (
     DEFAULT_FALLBACK_RESPONSE,
     ConversationAI,
-    GeminiClient,
-    GeminiClientError,
+    ConversationIntent,
+    ConversationManager,
+    ConversationProviderConfigurationError,
+    GeminiProvider,
+    LLMProvider,
+    LLMProviderError,
+    classify_intent,
+    create_llm_provider,
 )
 from conversation.worker import ConversationWorker
 from voice_detection.pipeline import VoicePipeline
 from voice_detection.speech_recognizer import TranscriptSegment
 
 
-class StubConversationClient:
+class StubProvider:
+    name = "test"
     model = "gemini-2.5-flash"
 
     def __init__(self, responses=None, error=None):
@@ -39,8 +46,8 @@ class StubConversationClient:
         self.calls = []
         self.closed = False
 
-    def generate(self, contents, system_instruction):
-        self.calls.append((contents, system_instruction))
+    def generate_response(self, context):
+        self.calls.append(context)
         if self.error is not None:
             raise self.error
         return self.responses.pop(0) if self.responses else ""
@@ -50,36 +57,43 @@ class StubConversationClient:
 
 
 class ConversationAITest(unittest.TestCase):
+    def test_legacy_conversation_ai_facade_uses_configured_provider(self):
+        with patch.dict(os.environ, {}, clear=True):
+            conversation = ConversationAI(api_key="test-key")
+        self.assertIsInstance(conversation, ConversationManager)
+        self.assertIsInstance(conversation.provider, GeminiProvider)
+
     def test_missing_api_key_returns_fallback(self):
         with patch.dict(os.environ, {}, clear=True):
-            conversation = ConversationAI()
+            conversation = ConversationManager(provider=GeminiProvider())
             with self.assertLogs("omnicare_ai.conversation", level="WARNING"):
                 response = conversation.respond("I feel tired")
         self.assertEqual(response, DEFAULT_FALLBACK_RESPONSE)
         self.assertEqual(conversation.history, ())
 
     def test_successful_gemini_response(self):
-        client = StubConversationClient(["  Bác đã nghỉ ngơi chưa ạ?  "])
-        conversation = ConversationAI(client=client)
+        provider = StubProvider(["  Bác đã nghỉ ngơi chưa ạ?  "])
+        conversation = ConversationManager(provider=provider)
 
         response = conversation.respond("I feel tired today")
 
         self.assertEqual(response, "Bác đã nghỉ ngơi chưa ạ?")
-        self.assertEqual(len(client.calls), 1)
-        self.assertIn("Luôn trả lời hoàn toàn bằng tiếng Việt", client.calls[0][1])
-        self.assertIn('người dùng là "bác"', client.calls[0][1])
-        self.assertIn("Không tiết lộ", client.calls[0][1])
-        self.assertIn("không chẩn đoán", client.calls[0][1])
+        self.assertEqual(len(provider.calls), 1)
+        prompt = provider.calls[0].system_instruction
+        self.assertIn("Luôn trả lời hoàn toàn bằng tiếng Việt", prompt)
+        self.assertIn('người dùng là "bác"', prompt)
+        self.assertIn("Không tiết lộ", prompt)
+        self.assertIn("không chẩn đoán", prompt)
 
     def test_empty_gemini_response_uses_fallback(self):
-        conversation = ConversationAI(client=StubConversationClient(["  "]))
+        conversation = ConversationManager(provider=StubProvider(["  "]))
         with self.assertLogs("omnicare_ai.conversation", level="WARNING"):
             response = conversation.respond("Hello")
         self.assertEqual(response, DEFAULT_FALLBACK_RESPONSE)
 
     def test_network_failure_uses_fallback(self):
-        conversation = ConversationAI(
-            client=StubConversationClient(error=TimeoutError("secret endpoint"))
+        conversation = ConversationManager(
+            provider=StubProvider(error=TimeoutError("secret endpoint"))
         )
         with self.assertLogs("omnicare_ai.conversation", level="WARNING") as logs:
             response = conversation.respond("Hello")
@@ -87,25 +101,28 @@ class ConversationAITest(unittest.TestCase):
         self.assertNotIn("secret endpoint", " ".join(logs.output))
 
     def test_gemini_client_failure_uses_fallback(self):
-        conversation = ConversationAI(
-            client=StubConversationClient(error=GeminiClientError("rate limited"))
+        conversation = ConversationManager(
+            provider=StubProvider(
+                error=LLMProviderError("rate limited", code="rate_limit")
+            )
         )
         response = conversation.respond("Hello")
         self.assertEqual(response, DEFAULT_FALLBACK_RESPONSE)
 
     def test_conversation_history_is_sent_as_recent_context(self):
-        client = StubConversationClient(["First answer", "Second answer"])
-        conversation = ConversationAI(client=client)
+        provider = StubProvider(["First answer", "Second answer"])
+        conversation = ConversationManager(provider=provider)
         conversation.respond("First question")
         conversation.respond("Second question")
 
-        roles = [item["role"] for item in client.calls[1][0]]
-        self.assertEqual(roles, ["user", "model", "user"])
+        roles = [item.role for item in provider.calls[1].recent_conversation]
+        self.assertEqual(roles, ["user", "model"])
+        self.assertEqual(provider.calls[1].user_text, "Second question")
         self.assertEqual(len(conversation.history), 2)
 
     def test_history_limit_keeps_only_recent_turns(self):
-        client = StubConversationClient([f"answer-{index}" for index in range(4)])
-        conversation = ConversationAI(client=client, history_limit=2)
+        provider = StubProvider([f"answer-{index}" for index in range(4)])
+        conversation = ConversationManager(provider=provider, history_limit=2)
         for index in range(4):
             conversation.respond(f"question-{index}")
         self.assertEqual(
@@ -114,8 +131,8 @@ class ConversationAITest(unittest.TestCase):
         )
 
     def test_reset_clears_history(self):
-        conversation = ConversationAI(
-            client=StubConversationClient(["Answer"])
+        conversation = ConversationManager(
+            provider=StubProvider(["Answer"])
         )
         conversation.respond("Question")
         conversation.reset()
@@ -132,11 +149,13 @@ class ConversationAITest(unittest.TestCase):
                 generate_content_stream=generate_content_stream,
             )
         )
-        client = GeminiClient(client=sdk_client, model="gemini-2.5-flash")
+        provider = GeminiProvider(client=sdk_client, model="gemini-2.5-flash")
+        self.assertIsInstance(provider, LLMProvider)
 
-        response = client.generate(
-            [{"role": "user", "parts": [{"text": "Hi"}]}],
-            "System prompt",
+        from conversation.llm_provider import LLMContext
+
+        response = provider.generate_response(
+            LLMContext("GREETING", (), "Hi", "System prompt")
         )
 
         self.assertEqual(response, "Chào bác ạ. Bác khỏe không?")
@@ -153,14 +172,58 @@ class ConversationAITest(unittest.TestCase):
 
     def test_model_can_be_configured_from_environment(self):
         with patch.dict(os.environ, {"GEMINI_MODEL": "custom-gemini-model"}):
-            client = GeminiClient(api_key="not-logged")
-        self.assertEqual(client.model, "custom-gemini-model")
+            provider = GeminiProvider(api_key="not-logged")
+        self.assertEqual(provider.model, "custom-gemini-model")
+
+    def test_manager_passes_structured_intent_context(self):
+        provider = StubProvider(["Dạ, bác nghỉ ngơi nhé."])
+        manager = ConversationManager(provider=provider)
+        manager.respond("Hôm nay tôi hơi mệt")
+        context = provider.calls[0]
+        self.assertEqual(context.intent, "HEALTH_COMPLAINT")
+        self.assertEqual(context.user_text, "Hôm nay tôi hơi mệt")
+        self.assertEqual(context.recent_conversation, ())
+
+
+class IntentClassifierTest(unittest.TestCase):
+    def test_supported_intents(self):
+        examples = {
+            "Chào bác": ConversationIntent.GREETING,
+            "Hôm nay tôi hơi mệt": ConversationIntent.HEALTH_COMPLAINT,
+            "Tôi muốn gọi cho con": ConversationIntent.FAMILY_QUERY,
+            "Hôm nay tôi đã ăn cơm rồi": ConversationIntent.DAILY_ACTIVITY,
+            "Tôi nhờ cháu mở cửa giúp": ConversationIntent.REQUEST_HELP,
+            "Tôi thích nghe nhạc cổ": ConversationIntent.UNKNOWN,
+        }
+        for text, expected in examples.items():
+            with self.subTest(text=text):
+                self.assertEqual(classify_intent(text), expected)
+
+
+class ProviderFactoryTest(unittest.TestCase):
+    def test_provider_selection_defaults_to_gemini(self):
+        with patch.dict(os.environ, {}, clear=True):
+            provider = create_llm_provider(api_key="test-key")
+        self.assertIsInstance(provider, GeminiProvider)
+        self.assertEqual(provider.name, "gemini")
+
+    def test_invalid_provider_configuration_is_clear(self):
+        with patch.dict(
+            os.environ,
+            {"CONVERSATION_PROVIDER": "unsupported"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                ConversationProviderConfigurationError,
+                "Unsupported CONVERSATION_PROVIDER",
+            ):
+                create_llm_provider()
 
 
 class ConversationWorkerTest(unittest.TestCase):
     def test_duplicate_transcript_is_submitted_once(self):
-        conversation = ConversationAI(
-            client=StubConversationClient(["Response"])
+        conversation = ConversationManager(
+            provider=StubProvider(["Response"])
         )
         worker = ConversationWorker(conversation=conversation).start()
         self.assertTrue(worker.submit(12.4, "I feel tired"))
@@ -172,8 +235,8 @@ class ConversationWorkerTest(unittest.TestCase):
         self.assertEqual(results[0].response_text, "Response")
 
     def test_fragments_produce_one_complete_response(self):
-        client = StubConversationClient(["Chào bác ạ."])
-        conversation = ConversationAI(client=client)
+        provider = StubProvider(["Chào bác ạ."])
+        conversation = ConversationManager(provider=provider)
         worker = ConversationWorker(
             conversation=conversation,
             settle_seconds=0.01,
@@ -187,7 +250,7 @@ class ConversationWorkerTest(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].user_text, "Oh, I'm sorry")
         self.assertEqual(results[0].response_text, "Chào bác ạ.")
-        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(provider.calls), 1)
 
         with contextlib.redirect_stdout(io.StringIO()) as output:
             run_ai.drain_conversation_results(

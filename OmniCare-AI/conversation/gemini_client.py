@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import os
 
+from .llm_provider import LLMContext, LLMProviderError
+
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 
-class GeminiClientError(RuntimeError):
+class GeminiProviderError(LLMProviderError):
     """Raised when Gemini cannot provide a usable response."""
 
 
-class GeminiClient:
+class GeminiProvider:
+    name = "gemini"
+
     def __init__(
         self,
         api_key=None,
@@ -30,12 +34,18 @@ class GeminiClient:
         if self._client is not None:
             return self._client
         if not self.api_key:
-            raise GeminiClientError("GEMINI_API_KEY is not configured")
+            raise GeminiProviderError(
+                "GEMINI_API_KEY is not configured",
+                code="missing_credentials",
+            )
         try:
             from google import genai
             from google.genai import types
         except ImportError as exc:
-            raise GeminiClientError("google-genai is not installed") from exc
+            raise GeminiProviderError(
+                "google-genai is not installed",
+                code="dependency_missing",
+            ) from exc
         try:
             self._client = genai.Client(
                 api_key=self.api_key,
@@ -44,11 +54,23 @@ class GeminiClient:
                 ),
             )
         except Exception as exc:
-            raise GeminiClientError("Gemini client initialization failed") from exc
+            raise GeminiProviderError("Gemini client initialization failed") from exc
         return self._client
 
-    def generate(self, contents, system_instruction):
+    def generate_response(self, context: LLMContext):
         client = self._ensure_client()
+        contents = [
+            {"role": message.role, "parts": [{"text": message.text}]}
+            for message in context.recent_conversation
+        ]
+        contents.append(
+            {"role": "user", "parts": [{"text": context.user_text}]}
+        )
+        system_instruction = (
+            f"{context.system_instruction}\n\n"
+            f"Ngữ cảnh ý định hiện tại: {context.intent}. "
+            "Chỉ dùng nhãn này làm ngữ cảnh nội bộ; không nhắc nhãn trong câu trả lời."
+        )
         try:
             response = client.models.generate_content(
                 model=self.model,
@@ -62,9 +84,9 @@ class GeminiClient:
             )
             text = getattr(response, "text", None)
         except Exception as exc:
-            raise GeminiClientError("Gemini request failed") from exc
+            raise GeminiProviderError("Gemini request failed") from exc
         if not isinstance(text, str) or not text.strip():
-            raise GeminiClientError("Gemini returned an empty response")
+            raise GeminiProviderError("Gemini returned an empty response")
         return " ".join(text.split())
 
     def close(self):
@@ -76,3 +98,8 @@ class GeminiClient:
                 close()
             except Exception:
                 pass
+
+
+# Compatibility names for code that imported the first Gemini adapter directly.
+GeminiClient = GeminiProvider
+GeminiClientError = GeminiProviderError

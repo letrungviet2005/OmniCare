@@ -23,6 +23,7 @@ from fall_detection.pipeline import FallEvent
 from voice_detection.pipeline import VoicePipeline
 from voice_detection.microphone_monitor import MicrophoneMonitor
 from voice_detection.speech_recognizer import TranscriptSegment
+from conversation.provider_factory import ConversationProviderConfigurationError
 
 
 class FakeImage:
@@ -501,6 +502,40 @@ class CameraMonitoringTest(unittest.TestCase):
         self.assertTrue(UnavailableMicrophone.instance.stopped)
         self.assertEqual(FakeCameraInput.instance.read_count, 2)
         self.assertIn("Monitoring stopped.", stdout.getvalue())
+
+    def test_invalid_conversation_provider_continues_monitoring(self):
+        class SilentMicrophone:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                return self
+
+            def poll(self):
+                return []
+
+            def stop(self):
+                pass
+
+        args = camera_args()
+        args.audio = True
+        args.conversation = True
+        with patch.object(run_ai, "CameraInput", FakeCameraInput), patch.object(
+            run_ai, "FallPipeline", RepeatingFallPipeline
+        ), patch.object(
+            run_ai, "MicrophoneMonitor", SilentMicrophone
+        ), patch.object(
+            run_ai,
+            "ConversationWorker",
+            side_effect=ConversationProviderConfigurationError("invalid provider"),
+        ):
+            with self.assertLogs("omnicare_ai", level="WARNING") as logs:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = run_ai.run_camera_monitor(args)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Conversation AI disabled", " ".join(logs.output))
+        self.assertEqual(FakeCameraInput.instance.read_count, 2)
 
 
 class RealtimeVoiceIntegrationTest(unittest.TestCase):

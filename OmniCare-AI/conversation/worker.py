@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from .conversation_ai import ConversationAI
+from .provider_factory import create_conversation_manager
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class ConversationWorker:
         recent_limit=64,
         settle_seconds=0.35,
     ):
-        self.conversation = conversation or ConversationAI()
+        self.conversation = conversation or create_conversation_manager()
         self._requests = queue.Queue(maxsize=max(1, int(max_pending)))
         self._results = queue.Queue(maxsize=max(2, int(max_pending) * 2))
         self._recent_ids = deque(maxlen=max(1, int(recent_limit)))
