@@ -24,9 +24,9 @@ from fall_detection.pipeline import (
     FallEvent,
     FallPipeline,
 )
-from voice_detection.audio_extractor import AudioExtractionError, AudioExtractor
+from voice_detection.audio.extractor import AudioExtractionError, AudioExtractor
 from voice_detection.pipeline import VoiceAnalysis, VoicePipeline
-from voice_detection.speech_recognizer import TranscriptSegment
+from voice_detection.speech.recognizer import TranscriptSegment
 
 
 def load_runner():
@@ -160,7 +160,7 @@ class SharedVideoContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "shared.wav"
             with patch(
-                "voice_detection.audio_extractor.subprocess.run",
+                "voice_detection.audio.extractor.subprocess.run",
                 side_effect=subprocess.TimeoutExpired("ffmpeg", 120),
             ):
                 with self.assertRaisesRegex(

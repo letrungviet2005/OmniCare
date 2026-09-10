@@ -19,21 +19,23 @@ for import_root in (ROOT, AI_ROOT):
         sys.path.insert(0, str(import_root))
 
 import run_ai
-from conversation import (
+from voice_detection.conversation import (
     DEFAULT_FALLBACK_RESPONSE,
     ConversationAI,
     ConversationIntent,
     ConversationManager,
     ConversationProviderConfigurationError,
     GeminiProvider,
+    GeminiProviderError,
+    LLMContext,
     LLMProvider,
     LLMProviderError,
     classify_intent,
     create_llm_provider,
 )
-from conversation.worker import ConversationWorker
+from voice_detection.conversation.worker import ConversationWorker
 from voice_detection.pipeline import VoicePipeline
-from voice_detection.speech_recognizer import TranscriptSegment
+from voice_detection.speech.recognizer import TranscriptSegment
 
 
 class StubProvider:
@@ -66,10 +68,14 @@ class ConversationAITest(unittest.TestCase):
     def test_missing_api_key_returns_fallback(self):
         with patch.dict(os.environ, {}, clear=True):
             conversation = ConversationManager(provider=GeminiProvider())
-            with self.assertLogs("omnicare_ai.conversation", level="WARNING"):
+            with self.assertLogs("omnicare_ai.conversation", level="WARNING") as logs:
                 response = conversation.respond("I feel tired")
         self.assertEqual(response, DEFAULT_FALLBACK_RESPONSE)
         self.assertEqual(conversation.history, ())
+        rendered = " ".join(logs.output)
+        self.assertIn("[missing_credentials]", rendered)
+        self.assertIn("request was not sent", rendered)
+        self.assertNotIn("Bearer", rendered)
 
     def test_successful_gemini_response(self):
         provider = StubProvider(["  Bác đã nghỉ ngơi chưa ạ?  "])
@@ -152,7 +158,7 @@ class ConversationAITest(unittest.TestCase):
         provider = GeminiProvider(client=sdk_client, model="gemini-2.5-flash")
         self.assertIsInstance(provider, LLMProvider)
 
-        from conversation.llm_provider import LLMContext
+        from voice_detection.conversation.llm_provider import LLMContext
 
         response = provider.generate_response(
             LLMContext("GREETING", (), "Hi", "System prompt")
@@ -174,6 +180,70 @@ class ConversationAITest(unittest.TestCase):
         with patch.dict(os.environ, {"GEMINI_MODEL": "custom-gemini-model"}):
             provider = GeminiProvider(api_key="not-logged")
         self.assertEqual(provider.model, "custom-gemini-model")
+
+    def test_gemini_failures_have_sanitized_diagnostic_categories(self):
+        class HttpFailure(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+
+        cases = (
+            (HttpFailure(401, "secret-key-value"), "authentication"),
+            (HttpFailure(404, "model not found: internal-resource"), "model_not_found"),
+            (HttpFailure(429, "quota project-secret"), "rate_limit"),
+            (TimeoutError("secret endpoint timed out"), "timeout"),
+            (ConnectionError("secret hostname connection refused"), "network"),
+            (HttpFailure(500, "private upstream body"), "provider_unavailable"),
+            (HttpFailure(400, "private request payload"), "request_rejected"),
+        )
+        for failure, expected in cases:
+            with self.subTest(expected=expected):
+                generate = Mock(side_effect=failure)
+                provider = GeminiProvider(
+                    client=SimpleNamespace(
+                        models=SimpleNamespace(generate_content=generate)
+                    )
+                )
+                with self.assertRaises(GeminiProviderError) as raised:
+                    provider.generate_response(
+                        LLMContext("UNKNOWN", (), "Xin chào", "System prompt")
+                    )
+                self.assertEqual(raised.exception.code, expected)
+                self.assertNotIn("secret", str(raised.exception).casefold())
+                self.assertNotIn("private", str(raised.exception).casefold())
+
+    def test_malformed_gemini_response_has_its_own_category(self):
+        provider = GeminiProvider(
+            client=SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content=Mock(return_value=SimpleNamespace(text=None))
+                )
+            )
+        )
+        with self.assertRaises(GeminiProviderError) as raised:
+            provider.generate_response(
+                LLMContext("UNKNOWN", (), "Xin chào", "System prompt")
+            )
+        self.assertEqual(raised.exception.code, "malformed_response")
+
+    def test_manager_logs_category_but_not_raw_provider_error(self):
+        provider = GeminiProvider(
+            client=SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content=Mock(
+                        side_effect=TimeoutError("https://secret-host.invalid/key-value")
+                    )
+                )
+            )
+        )
+        manager = ConversationManager(provider=provider)
+        with self.assertLogs("omnicare_ai.conversation", level="WARNING") as logs:
+            response = manager.respond("Xin chào")
+        rendered = " ".join(logs.output)
+        self.assertEqual(response, DEFAULT_FALLBACK_RESPONSE)
+        self.assertIn("[timeout]", rendered)
+        self.assertNotIn("secret-host", rendered)
+        self.assertNotIn("key-value", rendered)
 
     def test_manager_passes_structured_intent_context(self):
         provider = StubProvider(["Dạ, bác nghỉ ngơi nhé."])
@@ -266,7 +336,7 @@ class ConversationWorkerTest(unittest.TestCase):
         class SlowConversation:
             model = "gemini-2.5-flash"
 
-            def respond(self, _text):
+            def respond(self, _text, context_data=None):
                 request_started.set()
                 release_request.wait(timeout=2)
                 return "Dạ, cháu đang lắng nghe bác ạ."
@@ -306,8 +376,11 @@ class ConversationWorkerTest(unittest.TestCase):
             )
 
         self.assertEqual(updates, [])
-        conversation_worker.submit.assert_called_once_with(
-            12.4, "I feel tired today"
+        call = conversation_worker.submit.call_args
+        self.assertEqual(call.args[:2], (12.4, "I feel tired today"))
+        self.assertEqual(
+            call.args[2]["risk_engine"]["level"],
+            "NORMAL",
         )
 
     def test_emergency_transcript_bypasses_conversation(self):

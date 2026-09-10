@@ -92,6 +92,11 @@ class RunAiMonitorTest(unittest.TestCase):
         self.assertEqual(len(session.historical_events), 1)
         self.assertEqual(session.alerts_generated, 1)
 
+        snapshot = session.conversation_context_snapshot()
+        self.assertEqual(len(snapshot["event_engine"]["timeline"]), 1)
+        self.assertEqual(snapshot["risk_engine"]["level"], "NORMAL")
+        self.assertEqual(snapshot["alert_engine"]["type"], "NONE")
+
         help_event = {
             "timestamp": 45.0,
             "source": "voice_detection",

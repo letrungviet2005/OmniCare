@@ -4,6 +4,7 @@ import contextlib
 import io
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,9 +22,11 @@ from common.camera_input import CameraInput, CameraInputError
 from common.video_input import VideoFrame
 from fall_detection.pipeline import FallEvent
 from voice_detection.pipeline import VoicePipeline
-from voice_detection.microphone_monitor import MicrophoneMonitor
-from voice_detection.speech_recognizer import TranscriptSegment
-from conversation.provider_factory import ConversationProviderConfigurationError
+from voice_detection.audio.capture import MicrophoneMonitor
+from voice_detection.conversation.provider_factory import (
+    ConversationProviderConfigurationError,
+)
+from voice_detection.speech.recognizer import TranscriptSegment
 
 
 class FakeImage:
@@ -97,9 +100,10 @@ class RepeatingFallPipeline:
         return SimpleNamespace(timestamp=timestamp, status="FALL DETECTED", event=event)
 
 
-def camera_args(*, ingest=False, token=None):
+def camera_args(*, ingest=False, token=None, camera_id=None):
     return SimpleNamespace(
         camera=0,
+        camera_id=camera_id,
         monitor=True,
         ingest=ingest,
         token=token,
@@ -124,15 +128,36 @@ class CameraArgumentTest(unittest.TestCase):
     def test_camera_argument_is_parsed(self):
         args = self.parse("--camera", "0", "--monitor")
         self.assertEqual(args.camera, 0)
+        self.assertIsNone(args.camera_id)
         self.assertIsNone(args.video)
         self.assertTrue(args.monitor)
 
+    def test_persisted_camera_id_is_distinct_from_local_camera_index(self):
+        args = self.parse(
+            "--camera", "1", "--camera-id", "CAM-DEMO-002", "--monitor"
+        )
+        self.assertEqual(args.camera, 1)
+        self.assertEqual(args.camera_id, "CAM-DEMO-002")
+
+    def test_camera_id_requires_camera_mode(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse(
+                    "--video",
+                    "Videos/fall.mp4",
+                    "--camera-id",
+                    "CAM-DEMO-002",
+                )
+
     def test_audio_argument_is_available_for_camera_mode(self):
-        args = self.parse("--camera", "0", "--monitor", "--audio")
+        args = self.parse(
+            "--camera", "0", "--monitor", "--audio", "--microphone-device", "2"
+        )
         self.assertTrue(args.audio)
-        self.assertEqual(args.audio_language, "auto")
+        self.assertEqual(args.audio_language, "vi")
+        self.assertEqual(args.microphone_device, 2)
         self.assertEqual(args.audio_threshold, 70)
-        self.assertEqual(run_ai.REALTIME_WHISPER_MODEL, "base")
+        self.assertEqual(run_ai.REALTIME_WHISPER_MODEL, "small")
 
     def test_conversation_requires_camera_audio_mode(self):
         args = self.parse(
@@ -147,6 +172,15 @@ class CameraArgumentTest(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit):
                         self.parse(*invalid)
+
+    def test_tts_requires_conversation_mode(self):
+        args = self.parse(
+            "--camera", "0", "--monitor", "--audio", "--conversation", "--tts"
+        )
+        self.assertTrue(args.tts)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.parse("--camera", "0", "--monitor", "--audio", "--tts")
 
     def test_video_and_camera_are_mutually_exclusive(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -264,11 +298,11 @@ class CameraInputTest(unittest.TestCase):
             compute_type="int8",
             sounddevice_module=SimpleNamespace(),
         )
-        self.assertEqual(worker._decoder.model_name, "base")
-        self.assertEqual(worker.window_seconds, 2.5)
+        self.assertEqual(worker._decoder.model_name, "small")
+        self.assertEqual(worker.window_seconds, 8.0)
         self.assertEqual(worker._audio.maxsize, 128)
         self.assertEqual(worker._decoder.cpu_threads, 1)
-        self.assertEqual(worker._decoder.beam_size, 1)
+        self.assertEqual(worker._decoder.beam_size, 3)
         self.assertEqual(worker.min_speech_rms, 0.004)
 
     def test_realtime_microphone_skips_only_low_energy_windows(self):
@@ -334,6 +368,49 @@ class CameraMonitoringTest(unittest.TestCase):
         self.assertEqual(len(sent_result["event_engine"]["timeline"]), 1)
         self.assertIn("Backend ingestion requests: 1", stdout.getvalue())
 
+    def test_camera_id_is_merged_into_existing_event_payload(self):
+        ingestion = {
+            "analysisId": "AN-CAMERA-IDENTITY",
+            "duplicate": False,
+            "alertCreated": True,
+        }
+        with patch.object(run_ai, "CameraInput", FakeCameraInput), patch.object(
+            run_ai, "FallPipeline", RepeatingFallPipeline
+        ), patch.object(run_ai, "ingest_result", return_value=ingestion) as ingest, patch.object(
+            run_ai,
+            "ingest_activity_session",
+            return_value={
+                "success": True,
+                "activitySessionId": "ACT-CAMERA-IDENTITY",
+                "created": True,
+                "updated": False,
+                "duplicate": False,
+            },
+        ) as ingest_activity:
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = run_ai.run_camera_monitor(
+                    camera_args(
+                        ingest=True,
+                        token="jwt",
+                        camera_id="CAM-DEMO-002",
+                    )
+                )
+
+        self.assertEqual(code, 0)
+        ingest.assert_called_once()
+        ingest_activity.assert_called_once()
+        self.assertEqual(
+            ingest_activity.call_args.args[0]["activityType"], "FALLEN"
+        )
+        sent_result = ingest.call_args.args[0]
+        event = sent_result["events"][0]
+        self.assertEqual(event["payload"]["cameraId"], "CAM-DEMO-002")
+        self.assertEqual(event["payload"]["score"], 85)
+        self.assertEqual(
+            sent_result["event_engine"]["timeline"][0]["payload"]["cameraId"],
+            "CAM-DEMO-002",
+        )
+
     def test_backend_ingestion_does_not_pause_camera_frames(self):
         ingestion_started = threading.Event()
         release_ingestion = threading.Event()
@@ -396,7 +473,7 @@ class CameraMonitoringTest(unittest.TestCase):
                         "result",
                         SimpleNamespace(
                             segments=[
-                                TranscriptSegment(1.0, 1.8, "Hello there")
+                                TranscriptSegment(1.0, 1.8, "Hello there today")
                             ]
                         ),
                     )
@@ -408,7 +485,7 @@ class CameraMonitoringTest(unittest.TestCase):
         class SlowConversation:
             model = "gemini-2.5-flash"
 
-            def respond(self, _text):
+            def respond(self, _text, context_data=None):
                 request_started.set()
                 release_request.wait(timeout=2)
                 return "Chào bác ạ."
@@ -439,6 +516,172 @@ class CameraMonitoringTest(unittest.TestCase):
                 self.assertTrue(request_started.wait(timeout=1))
                 self.assertTrue(second_frame_read.wait(timeout=1))
                 release_request.set()
+                runner.join(timeout=2)
+
+        self.assertFalse(runner.is_alive())
+        self.assertEqual(outcome["code"], 0)
+
+    def test_tts_configuration_failure_continues_camera_monitoring(self):
+        class SilentMicrophone:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                return self
+
+            def poll(self):
+                return []
+
+            def stop(self):
+                pass
+
+        class IdleConversationWorker:
+            conversation = SimpleNamespace(
+                provider=SimpleNamespace(name="test"),
+                model="test-model",
+            )
+
+            def start(self):
+                return self
+
+            def poll(self):
+                return []
+
+            def stop(self):
+                pass
+
+        args = camera_args()
+        args.audio = True
+        args.conversation = True
+        args.tts = True
+        args.tts_provider = "invalid"
+        args.tts_voice = None
+        with patch.object(run_ai, "CameraInput", FakeCameraInput), patch.object(
+            run_ai, "FallPipeline", RepeatingFallPipeline
+        ), patch.object(
+            run_ai, "MicrophoneMonitor", SilentMicrophone
+        ), patch.object(
+            run_ai, "ConversationWorker", return_value=IdleConversationWorker()
+        ), patch.object(
+            run_ai,
+            "create_tts_provider",
+            side_effect=run_ai.TTSProviderError("unavailable"),
+        ):
+            with self.assertLogs("omnicare_ai", level="WARNING") as logs:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = run_ai.run_camera_monitor(args)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(FakeCameraInput.instance.read_count, 2)
+        self.assertIn("TTS disabled", " ".join(logs.output))
+
+    def test_blocked_tts_worker_does_not_pause_camera_frames(self):
+        synthesis_started = threading.Event()
+        release_synthesis = threading.Event()
+        second_frame_read = threading.Event()
+        outcome = {}
+
+        class AwaitingTtsCv2(FakeCv2):
+            def __init__(self):
+                super().__init__(quit_after=200)
+
+            def waitKey(self, _delay):
+                self.wait_calls += 1
+                if synthesis_started.is_set() and self.wait_calls >= 2:
+                    return ord("q")
+                time.sleep(0.002)
+                return ord("q") if self.wait_calls >= self.quit_after else -1
+
+        class SignalingCamera(FakeCameraInput):
+            def __init__(self, camera_index):
+                super().__init__(camera_index)
+                self.cv2 = AwaitingTtsCv2()
+
+            def read(self):
+                frame = super().read()
+                if self.read_count == 2:
+                    second_frame_read.set()
+                return frame
+
+        class SilentMicrophone:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                return self
+
+            def poll(self):
+                return []
+
+            def stop(self):
+                pass
+
+        class OneResponseConversationWorker:
+            conversation = SimpleNamespace(
+                provider=SimpleNamespace(name="test"),
+                model="test-model",
+            )
+
+            def __init__(self):
+                self.sent = False
+
+            def start(self):
+                return self
+
+            def poll(self):
+                if self.sent:
+                    return []
+                self.sent = True
+                return [
+                    SimpleNamespace(
+                        user_text="Xin chào",
+                        response_text="Chào bác ạ.",
+                        processing_seconds=0.01,
+                    )
+                ]
+
+            def stop(self):
+                pass
+
+        class SlowTtsProvider:
+            def synthesize(self, _text):
+                synthesis_started.set()
+                release_synthesis.wait(timeout=2)
+                return b"RIFF-wave"
+
+            def close(self):
+                release_synthesis.set()
+
+        provider = SlowTtsProvider()
+        player = SimpleNamespace(play=lambda _audio: None, stop=lambda: None)
+        tts_worker = run_ai.TTSWorker(provider, player=player)
+        args = camera_args()
+        args.audio = True
+        args.conversation = True
+        args.tts = True
+        args.tts_provider = "test"
+        args.tts_voice = None
+
+        def run_camera():
+            outcome["code"] = run_ai.run_camera_monitor(args)
+
+        with patch.object(run_ai, "CameraInput", SignalingCamera), patch.object(
+            run_ai, "FallPipeline", RepeatingFallPipeline
+        ), patch.object(
+            run_ai, "MicrophoneMonitor", SilentMicrophone
+        ), patch.object(
+            run_ai,
+            "ConversationWorker",
+            return_value=OneResponseConversationWorker(),
+        ), patch.object(
+            run_ai, "create_tts_provider", return_value=provider
+        ), patch.object(run_ai, "TTSWorker", return_value=tts_worker):
+            with contextlib.redirect_stdout(io.StringIO()):
+                runner = threading.Thread(target=run_camera)
+                runner.start()
+                self.assertTrue(synthesis_started.wait(timeout=1))
+                self.assertTrue(second_frame_read.wait(timeout=1))
+                release_synthesis.set()
                 runner.join(timeout=2)
 
         self.assertFalse(runner.is_alive())

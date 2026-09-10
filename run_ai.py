@@ -1,6 +1,7 @@
 """Run Fall Detection, Voice Detection, and Conversation on one video file."""
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -11,6 +12,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -30,16 +33,25 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from common.camera_input import CameraInput, CameraInputError
 from common.video_input import VideoInput, VideoInputError
-from conversation.pipeline import ConversationPipeline, ConversationPipelineError
-from conversation.provider_factory import ConversationProviderConfigurationError
-from conversation.worker import ConversationWorker
 from alert_engine import AlertEngine, AlertEngineError
 from event_engine import EventEngine, EventEngineError
+from fall_detection.activity_session_producer import FallActivitySessionProducer
 from fall_detection.pipeline import FallPipeline, FallPipelineError
 from risk_engine import RiskEngine, RiskEngineError
-from voice_detection.audio_extractor import AudioExtractionError, AudioExtractor
-from voice_detection.microphone_monitor import MicrophoneMonitor
+from voice_detection.audio.capture import MicrophoneMonitor
+from voice_detection.audio.gate import AudioInputGate
+from voice_detection.audio.extractor import AudioExtractionError, AudioExtractor
+from voice_detection.config.settings import VoiceSettings, microphone_device
+from voice_detection.conversation.pipeline import (
+    ConversationPipeline,
+    ConversationPipelineError,
+)
+from voice_detection.conversation.provider_factory import (
+    ConversationProviderConfigurationError,
+)
+from voice_detection.conversation.worker import ConversationWorker
 from voice_detection.pipeline import VoicePipeline, VoicePipelineError
+from voice_detection.tts import TTSProviderError, TTSWorker, create_tts_provider
 
 
 LOGGER = logging.getLogger("omnicare_ai")
@@ -47,7 +59,8 @@ DEFAULT_BACKEND_URL = "http://localhost:3001"
 MONITOR_HEARTBEAT_SECONDS = 4.0
 MONITOR_FPS_LOG_SECONDS = 10.0
 RISK_RECOVERY_SECONDS = 30.0
-REALTIME_WHISPER_MODEL = "base"
+VOICE_SETTINGS = VoiceSettings.from_environment()
+REALTIME_WHISPER_MODEL = VOICE_SETTINGS.realtime_model
 REALTIME_VOICE_THRESHOLD = 70
 MEANINGFUL_EVENT_TYPES = frozenset(
     {
@@ -126,6 +139,159 @@ class CameraIngestionWorker:
         self._thread.join(timeout=20)
 
 
+class ConversationPersistenceWorker:
+    """Persist completed exchanges without blocking camera, audio, or LLM work."""
+
+    def __init__(self, backend_url, token, conversation_id, camera_id, session_started_at, max_pending=8):
+        self.backend_url = backend_url
+        self.token = token
+        self.conversation_id = conversation_id
+        self.camera_id = camera_id
+        self.session_started_at = session_started_at
+        self._requests = queue.Queue(maxsize=max(1, int(max_pending)))
+        self._results = queue.Queue(maxsize=max(2, int(max_pending) * 2))
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run,
+            name="omnicare-conversation-persistence",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def submit(self, result):
+        user_occurred_at = self.session_started_at + timedelta(
+            seconds=max(0.0, float(result.timestamp))
+        )
+        exchange_id = ConversationWorker.transcript_id(result.timestamp, result.user_text)
+        payload = {
+            "conversationId": self.conversation_id,
+            "exchangeId": exchange_id,
+            "cameraId": self.camera_id,
+            "userText": result.user_text,
+            "assistantText": result.response_text,
+            "intent": getattr(result, "intent", None),
+            "userOccurredAt": utc_text(user_occurred_at),
+            "assistantOccurredAt": utc_text(datetime.now(timezone.utc)),
+            "metadata": {
+                "source": "realtime_microphone",
+                "relativeTimestamp": float(result.timestamp),
+            },
+        }
+        try:
+            self._requests.put_nowait(payload)
+            return True
+        except queue.Full:
+            return False
+
+    def poll(self):
+        results = []
+        while True:
+            try:
+                results.append(self._results.get_nowait())
+            except queue.Empty:
+                return results
+
+    def _emit(self, item):
+        try:
+            self._results.put_nowait(item)
+        except queue.Full:
+            try:
+                self._results.get_nowait()
+                self._results.put_nowait(item)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def _run(self):
+        while True:
+            payload = self._requests.get()
+            if payload is None:
+                return
+            try:
+                response = ingest_conversation(payload, self.backend_url, self.token)
+            except BackendIngestionError as exc:
+                self._emit(("error", str(exc)))
+            else:
+                self._emit(("success", response))
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._requests.put(None)
+        self._thread.join(timeout=20)
+
+
+class ActivityPersistenceWorker:
+    """Persist bounded activity updates without pausing camera inference."""
+
+    def __init__(self, backend_url, token, max_pending=8):
+        self.backend_url = backend_url
+        self.token = token
+        self._requests = queue.Queue(maxsize=max(1, int(max_pending)))
+        self._results = queue.Queue(maxsize=max(2, int(max_pending) * 2))
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run,
+            name="omnicare-activity-persistence",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def submit(self, payload):
+        try:
+            self._requests.put_nowait(payload)
+            return True
+        except queue.Full:
+            return False
+
+    def poll(self):
+        results = []
+        while True:
+            try:
+                results.append(self._results.get_nowait())
+            except queue.Empty:
+                return results
+
+    def _emit(self, item):
+        try:
+            self._results.put_nowait(item)
+        except queue.Full:
+            try:
+                self._results.get_nowait()
+                self._results.put_nowait(item)
+            except (queue.Empty, queue.Full):
+                pass
+
+    def _run(self):
+        while True:
+            payload = self._requests.get()
+            if payload is None:
+                return
+            try:
+                response = ingest_activity_session(
+                    payload, self.backend_url, self.token
+                )
+            except BackendIngestionError as exc:
+                self._emit(("error", str(exc)))
+            else:
+                self._emit(("success", response))
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._requests.put(None)
+        self._thread.join(timeout=20)
+
+
+def utc_text(value):
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run OmniCare AI on one video or a local webcam."
@@ -133,17 +299,25 @@ def parse_args():
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--video", help="Shared source video, e.g. Videos/test_video.mp4")
     source.add_argument("--camera", type=camera_index, help="OpenCV camera index, e.g. 0")
+    parser.add_argument(
+        "--camera-id",
+        help="Persisted OmniCare camera ID associated with --camera, e.g. CAM-DEMO-002",
+    )
     parser.add_argument("--model", default="small", help="Faster-Whisper model name (default: small)")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--compute-type", default=None, help="Optional CTranslate2 compute type")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default=VOICE_SETTINGS.device)
+    parser.add_argument("--compute-type", default=VOICE_SETTINGS.compute_type, help="Optional CTranslate2 compute type")
     parser.add_argument("--language", choices=("auto", "vi", "ko"), default="vi")
     parser.add_argument("--threshold", type=float, default=78, help="Voice emergency phrase threshold")
     parser.add_argument("--fusion-window", type=float, default=10.0, help="Event Engine fall/voice fusion window in seconds (default: 10)")
     parser.add_argument("--monitor", action="store_true", help="Continuously monitor the source timeline until it ends")
     parser.add_argument("--audio", action="store_true", help="Enable microphone monitoring in camera mode")
-    parser.add_argument("--audio-language", choices=("auto", "vi", "ko", "en"), default="auto", help="Realtime microphone language (default: auto)")
+    parser.add_argument("--audio-language", choices=("auto", "vi", "ko", "en"), default=VOICE_SETTINGS.language, help="Realtime microphone language (default: vi)")
+    parser.add_argument("--microphone-device", type=microphone_device, default=VOICE_SETTINGS.microphone_device, help="Optional sounddevice input index or device name")
     parser.add_argument("--audio-threshold", type=float, default=REALTIME_VOICE_THRESHOLD, help="Realtime emergency phrase threshold (default: 70)")
     parser.add_argument("--conversation", action="store_true", help="Enable Gemini responses for normal microphone transcripts")
+    parser.add_argument("--tts", action="store_true", help="Speak Conversation responses on a background TTS worker")
+    parser.add_argument("--tts-provider", default=os.getenv("TTS_PROVIDER", "windows-sapi"), help="TTS provider (default: windows-sapi)")
+    parser.add_argument("--tts-voice", default=os.getenv("OMNICARE_TTS_VOICE"), help="Optional installed Windows SAPI voice name")
     parser.add_argument("--ingest", action="store_true", help="POST the final structured result to Spring Boot")
     parser.add_argument("--backend-url", default=os.getenv("OMNICARE_BACKEND_URL", DEFAULT_BACKEND_URL), help="Spring Boot base URL")
     parser.add_argument("--token", default=os.getenv("OMNICARE_JWT_TOKEN"), help="Existing JWT for optional ingestion")
@@ -151,10 +325,18 @@ def parse_args():
     args = parser.parse_args()
     if args.camera is not None and not args.monitor:
         parser.error("--camera requires --monitor")
+    if args.camera_id is not None:
+        args.camera_id = args.camera_id.strip()
+        if args.camera is None:
+            parser.error("--camera-id requires --camera")
+        if not args.camera_id:
+            parser.error("--camera-id cannot be empty")
     if args.audio and args.camera is None:
         parser.error("--audio requires --camera")
     if args.conversation and (args.camera is None or not args.audio):
         parser.error("--conversation requires --camera and --audio")
+    if args.tts and not args.conversation:
+        parser.error("--tts requires --conversation")
     return args
 
 
@@ -245,6 +427,7 @@ class MonitoringSession:
         self._next_heartbeat = self.heartbeat_seconds
         self._next_fps_report = MONITOR_FPS_LOG_SECONDS
         self._structured_events = []
+        self._fused_events = []
         self._published_event_ids = set()
         self._alert_signatures = set()
         self._backend_requests = 0
@@ -256,6 +439,23 @@ class MonitoringSession:
         self.latest_alert_type = "NONE"
         self.latest_voice_text = None
         self.should_alert = False
+        self._current_risk = {
+            "level": "NORMAL",
+            "score": 0,
+            "reasons": [],
+            "related_event_ids": [],
+        }
+        self._current_alert = {
+            "should_alert": False,
+            "priority": "NONE",
+            "type": "NONE",
+            "message": None,
+            "timestamp": None,
+            "related_event_ids": [],
+            "risk_level": "NORMAL",
+            "risk_score": 0,
+            "reasons": [],
+        }
 
     @property
     def events_detected(self):
@@ -291,6 +491,18 @@ class MonitoringSession:
     def historical_events(self):
         return tuple(self._structured_events)
 
+    def conversation_context_snapshot(self):
+        """Copy only a small engine-output slice for the background builder."""
+        return {
+            "event_engine": {
+                "timeline": copy.deepcopy(self._structured_events[-16:]),
+                "fused_events": copy.deepcopy(self._fused_events[-16:]),
+            },
+            "risk_engine": copy.deepcopy(self._current_risk),
+            "alert_engine": copy.deepcopy(self._current_alert),
+            "current_timestamp": self._current_timestamp,
+        }
+
     def advance_time(self, timestamp):
         """Advance current state without removing historical engine events."""
         self._current_timestamp = max(self._current_timestamp, float(timestamp))
@@ -306,6 +518,23 @@ class MonitoringSession:
         self.latest_alert_type = "NONE"
         self.latest_voice_text = None
         self.should_alert = False
+        self._current_risk = {
+            "level": "NORMAL",
+            "score": 0,
+            "reasons": [],
+            "related_event_ids": [],
+        }
+        self._current_alert = {
+            "should_alert": False,
+            "priority": "NONE",
+            "type": "NONE",
+            "message": None,
+            "timestamp": None,
+            "related_event_ids": [],
+            "risk_level": "NORMAL",
+            "risk_score": 0,
+            "reasons": [],
+        }
         self._last_concerning_timestamp = None
         print(
             f"[MONITOR] {format_monitor_timestamp(self._current_timestamp)} "
@@ -348,6 +577,9 @@ class MonitoringSession:
                 fusion_window_seconds=self.fusion_window_seconds
             ).process([*self._structured_events, event])
             self._structured_events = [item.to_dict() for item in event_result.timeline]
+            self._fused_events = [
+                item.to_dict() for item in event_result.fused_events
+            ]
             _, risk, alert = self._evaluate_new_event(float(event["timestamp"]))
 
             candidates = [
@@ -372,6 +604,8 @@ class MonitoringSession:
                 self.latest_event_type = candidate.type
                 self.latest_alert_type = alert.type
                 self.should_alert = alert.should_alert
+                self._current_risk = risk.to_dict()
+                self._current_alert = alert.to_dict()
                 self._last_concerning_timestamp = max(
                     candidate.timestamp,
                     self._last_concerning_timestamp
@@ -473,6 +707,104 @@ def ingest_result(result, backend_url, token, timeout=15):
         "duplicate": parsed["duplicate"],
         "alertCreated": parsed["alertCreated"],
     }
+
+
+def ingest_conversation(payload, backend_url, token, timeout=15):
+    if not token:
+        raise BackendIngestionError("Conversation persistence requires a JWT.")
+    if not backend_url:
+        raise BackendIngestionError("Backend URL cannot be empty.")
+    request = urllib.request.Request(
+        f"{backend_url.rstrip('/')}/api/v1/ai/conversations",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            status = getattr(response, "status", response.getcode())
+    except urllib.error.HTTPError as exc:
+        raise BackendIngestionError(
+            f"Conversation persistence failed with HTTP {exc.code}."
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", None) or str(exc)
+        raise BackendIngestionError(
+            f"Conversation persistence connection failed: {reason}"
+        ) from exc
+    if status < 200 or status >= 300:
+        raise BackendIngestionError(
+            f"Conversation persistence failed with HTTP {status}."
+        )
+    try:
+        parsed = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise BackendIngestionError(
+            "Backend returned malformed conversation persistence JSON."
+        ) from exc
+    if (
+        not isinstance(parsed, dict)
+        or parsed.get("success") is not True
+        or not isinstance(parsed.get("conversationId"), str)
+        or not isinstance(parsed.get("duplicate"), bool)
+    ):
+        raise BackendIngestionError(
+            "Backend returned an invalid conversation persistence response."
+        )
+    return parsed
+
+
+def ingest_activity_session(payload, backend_url, token, timeout=15):
+    if not token:
+        raise BackendIngestionError("Activity persistence requires a JWT.")
+    if not backend_url:
+        raise BackendIngestionError("Backend URL cannot be empty.")
+    request = urllib.request.Request(
+        f"{backend_url.rstrip('/')}/api/v1/ai/activity-sessions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            status = getattr(response, "status", response.getcode())
+    except urllib.error.HTTPError as exc:
+        raise BackendIngestionError(
+            f"Activity persistence failed with HTTP {exc.code}."
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", None) or str(exc)
+        raise BackendIngestionError(
+            f"Activity persistence connection failed: {reason}"
+        ) from exc
+    if status < 200 or status >= 300:
+        raise BackendIngestionError(
+            f"Activity persistence failed with HTTP {status}."
+        )
+    try:
+        parsed = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise BackendIngestionError(
+            "Backend returned malformed activity persistence JSON."
+        ) from exc
+    if (
+        not isinstance(parsed, dict)
+        or parsed.get("success") is not True
+        or not isinstance(parsed.get("activitySessionId"), str)
+        or not isinstance(parsed.get("duplicate"), bool)
+    ):
+        raise BackendIngestionError(
+            "Backend returned an invalid activity persistence response."
+        )
+    return parsed
 
 
 def run_pipeline(args, monitor=None):
@@ -640,9 +972,27 @@ def run_monitor(args):
     return 1 if ingestion_failed else 0
 
 
-def camera_event_result(source, camera_frame, frames_analyzed, observed_fps, event, fusion_window):
+def camera_event_result(
+    source,
+    camera_frame,
+    frames_analyzed,
+    observed_fps,
+    event,
+    fusion_window,
+    camera_id=None,
+    session_started_at=None,
+):
     """Build the existing structured analysis contract for one new camera event."""
     normalized = event.to_dict()
+    if camera_id:
+        payload = normalized.get("payload")
+        payload = dict(payload) if isinstance(payload, dict) else {}
+        payload["cameraId"] = camera_id
+        normalized["payload"] = payload
+    if session_started_at is not None:
+        normalized["occurredAt"] = utc_text(
+            session_started_at + timedelta(seconds=max(0.0, float(event.timestamp)))
+        )
     if event.type == "COMBINED_EMERGENCY":
         event_engine_data = {
             "timeline": [],
@@ -725,17 +1075,34 @@ def drain_microphone_events(
 
     for kind, payload in messages:
         if kind == "loading":
-            LOGGER.info("%s", payload)
+            LOGGER.debug("%s", payload)
+        elif kind == "microphone":
+            LOGGER.info(
+                "[MIC] READY | device=%s (%s) | rate=%d Hz | channels=%d",
+                payload.name,
+                payload.device_id,
+                payload.capture_sample_rate,
+                payload.channels,
+            )
+        elif kind == "runtime":
+            LOGGER.info("[WHISPER] %s", payload)
         elif kind == "ready":
-            LOGGER.info("Realtime microphone: OK (%s).", payload)
             audio_status = "ON"
         elif kind in ("warning", "error"):
             LOGGER.warning("Realtime audio: %s", payload)
             if kind == "error":
                 audio_status = "OFF"
         elif kind == "result":
-            voice_risk = voice_pipeline.detector.analyze(payload.segments).to_dict()
-            for segment in payload.segments:
+            LOGGER.debug(
+                "[WHISPER] Utterance transcription: %.2fs (%s)",
+                getattr(payload, "processing_seconds", 0.0),
+                getattr(payload, "language", "unknown"),
+            )
+            quality_segments = voice_pipeline.accepted_segments(
+                payload.segments, log_rejections=True
+            )
+            voice_risk = voice_pipeline.detector.analyze(quality_segments).to_dict()
+            for segment in quality_segments:
                 voice_events = voice_pipeline.events_from_segments([segment])
                 if voice_events:
                     for voice_event in voice_events:
@@ -756,8 +1123,17 @@ def drain_microphone_events(
                         updates.extend(session.observe_events([raw_event]))
                     continue
 
+                assessment = voice_pipeline.assess_segment_quality(segment)
+                if not assessment.allow_conversation:
+                    LOGGER.debug(
+                        "Conversation skipped a short transcript (%d words).",
+                        assessment.word_count,
+                    )
+                    continue
                 if conversation_worker is not None and conversation_worker.submit(
-                    segment.start, segment.text
+                    segment.start,
+                    segment.text,
+                    session.conversation_context_snapshot(),
                 ):
                     print(
                         f"[AUDIO] {format_monitor_timestamp(segment.start)} "
@@ -767,7 +1143,7 @@ def drain_microphone_events(
     return audio_status, updates
 
 
-def drain_conversation_results(worker):
+def drain_conversation_results(worker, tts_worker=None, persistence_worker=None):
     if worker is None:
         return
     for result in worker.poll():
@@ -779,6 +1155,38 @@ def drain_conversation_results(worker):
             f"[CONVERSATION] OmniCare: {result.response_text}",
             flush=True,
         )
+        LOGGER.debug(
+            "Conversation response latency: %.2fs.",
+            getattr(result, "processing_seconds", 0.0),
+        )
+        if tts_worker is not None and not tts_worker.submit(result.response_text):
+            LOGGER.warning("TTS queue is full; response will remain text-only.")
+        if persistence_worker is not None and not persistence_worker.submit(result):
+            LOGGER.warning("Conversation persistence queue is full; exchange was not stored.")
+
+
+def drain_tts_results(worker):
+    if worker is None:
+        return
+    for kind, payload in worker.poll():
+        if kind == "warning":
+            LOGGER.warning("%s", payload)
+        elif kind == "speaking":
+            print("[TTS] Speaking response...", flush=True)
+        elif kind == "result":
+            LOGGER.debug(
+                "TTS completed: queue %.2fs, synthesis %.2fs, audio %s, "
+                "playback %.2fs, total %.2fs.",
+                payload.queue_wait_seconds,
+                payload.synthesis_seconds,
+                (
+                    f"{payload.audio_duration_seconds:.2f}s"
+                    if payload.audio_duration_seconds is not None
+                    else "unknown"
+                ),
+                payload.playback_seconds,
+                payload.total_seconds,
+            )
 
 
 def drain_ingestion_results(worker):
@@ -795,6 +1203,37 @@ def drain_ingestion_results(worker):
             f"alertCreated: {str(payload['alertCreated']).lower()}",
             flush=True,
         )
+
+
+def drain_conversation_persistence_results(worker):
+    if worker is None:
+        return
+    for kind, payload in worker.poll():
+        if kind == "error":
+            LOGGER.warning("Conversation persistence failed: %s", payload)
+        else:
+            LOGGER.debug(
+                "Conversation persisted: %s (%d messages, duplicate=%s).",
+                payload.get("conversationId"),
+                payload.get("messageCount", 0),
+                payload.get("duplicate", False),
+            )
+
+
+def drain_activity_persistence_results(worker):
+    if worker is None:
+        return
+    for kind, payload in worker.poll():
+        if kind == "error":
+            LOGGER.warning("Activity persistence failed: %s", payload)
+        else:
+            LOGGER.debug(
+                "Activity session persisted: %s (created=%s, updated=%s, duplicate=%s).",
+                payload.get("activitySessionId"),
+                payload.get("created", False),
+                payload.get("updated", False),
+                payload.get("duplicate", False),
+            )
 
 
 def draw_camera_overlay(
@@ -862,11 +1301,20 @@ def run_camera_monitor(args):
     audio_worker = None
     ingestion_worker = None
     conversation_worker = None
+    conversation_persistence_worker = None
+    activity_producer = None
+    activity_persistence_worker = None
+    tts_worker = None
+    audio_input_gate = AudioInputGate()
     voice_pipeline = None
+    session_started_at = None
     audio_status = "OFF"
     LOGGER.info("Opening camera index %d...", args.camera)
+    if getattr(args, "camera_id", None):
+        LOGGER.info("Persisted camera identity: %s", args.camera_id)
     try:
         source.open()
+        session_started_at = datetime.now(timezone.utc)
         LOGGER.info("Camera stream: OK. Press q or Ctrl+C to stop.")
         fall_pipeline = FallPipeline()
         processing_started = time.monotonic()
@@ -874,6 +1322,21 @@ def run_camera_monitor(args):
             ingestion_worker = CameraIngestionWorker(
                 args.backend_url, args.token
             ).start()
+            if getattr(args, "camera_id", None):
+                monitoring_session_id = "MON-" + uuid.uuid4().hex
+                activity_producer = FallActivitySessionProducer(
+                    args.camera_id,
+                    monitoring_session_id,
+                    session_started_at,
+                )
+                activity_persistence_worker = ActivityPersistenceWorker(
+                    args.backend_url, args.token
+                ).start()
+            else:
+                LOGGER.warning(
+                    "Activity persistence disabled: --camera-id is required "
+                    "to resolve the elderly person."
+                )
         if getattr(args, "conversation", False):
             try:
                 conversation_worker = ConversationWorker().start()
@@ -891,13 +1354,55 @@ def run_camera_monitor(args):
                     getattr(provider, "name", "injected"),
                     conversation_worker.conversation.model,
                 )
+                if args.ingest:
+                    if getattr(args, "camera_id", None):
+                        conversation_persistence_worker = ConversationPersistenceWorker(
+                            args.backend_url,
+                            args.token,
+                            "CONV-" + uuid.uuid4().hex,
+                            args.camera_id,
+                            session_started_at,
+                        ).start()
+                    else:
+                        LOGGER.warning(
+                            "Conversation persistence disabled: --camera-id is required "
+                            "to resolve the elderly person."
+                        )
+                if getattr(args, "tts", False):
+                    try:
+                        tts_provider = create_tts_provider(
+                                getattr(args, "tts_provider", None),
+                                getattr(args, "tts_voice", None),
+                            )
+                        selected_voice = getattr(tts_provider, "selected_voice", None)
+                        selected_culture = getattr(
+                            tts_provider, "selected_voice_culture", None
+                        )
+                        if selected_voice:
+                            LOGGER.info(
+                                "[TTS] Vietnamese voice: %s (%s).",
+                                selected_voice,
+                                selected_culture or "unknown language",
+                            )
+                        voice_warning = getattr(tts_provider, "voice_warning", None)
+                        if voice_warning:
+                            LOGGER.warning("[TTS] %s", voice_warning)
+                        tts_worker = TTSWorker(
+                            tts_provider,
+                            input_gate=audio_input_gate,
+                        ).start()
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "TTS disabled: %s Conversation will remain text-only.",
+                            exc,
+                        )
         if getattr(args, "audio", False):
             try:
                 voice_pipeline = VoicePipeline(
                     model_name=REALTIME_WHISPER_MODEL,
                     device=getattr(args, "device", "auto"),
                     compute_type=getattr(args, "compute_type", None),
-                    language=getattr(args, "audio_language", "auto"),
+                    language=getattr(args, "audio_language", "vi"),
                     threshold=getattr(
                         args, "audio_threshold", REALTIME_VOICE_THRESHOLD
                     ),
@@ -907,7 +1412,9 @@ def run_camera_monitor(args):
                     model_name=REALTIME_WHISPER_MODEL,
                     device=getattr(args, "device", "auto"),
                     compute_type=getattr(args, "compute_type", None),
-                    language=getattr(args, "audio_language", "auto"),
+                    language=getattr(args, "audio_language", "vi"),
+                    microphone_device=getattr(args, "microphone_device", None),
+                    input_gate=audio_input_gate,
                 ).start()
                 audio_status = "STARTING"
             except Exception as exc:
@@ -926,6 +1433,16 @@ def run_camera_monitor(args):
             )
             frames_analyzed += 1
             updates = session.observe_fall_frame(frame_result)
+            if activity_producer is not None:
+                for activity_update in activity_producer.observe(
+                    frame_result, updates
+                ):
+                    if not activity_persistence_worker.submit(
+                        activity_update.to_dict()
+                    ):
+                        LOGGER.warning(
+                            "Activity persistence queue is full; update was not stored."
+                        )
             if audio_worker is not None and voice_pipeline is not None:
                 audio_status, audio_updates = drain_microphone_events(
                     audio_worker,
@@ -935,8 +1452,15 @@ def run_camera_monitor(args):
                     conversation_worker,
                 )
                 updates.extend(audio_updates)
-            drain_conversation_results(conversation_worker)
+            drain_conversation_results(
+                conversation_worker,
+                tts_worker,
+                conversation_persistence_worker,
+            )
+            drain_tts_results(tts_worker)
             drain_ingestion_results(ingestion_worker)
+            drain_conversation_persistence_results(conversation_persistence_worker)
+            drain_activity_persistence_results(activity_persistence_worker)
             processing_elapsed = max(time.monotonic() - processing_started, 1e-9)
             observed_fps = frames_analyzed / processing_elapsed
             session.report_processing_fps(camera_frame.timestamp, observed_fps)
@@ -963,6 +1487,8 @@ def run_camera_monitor(args):
                     observed_fps,
                     event,
                     getattr(args, "fusion_window", 10.0),
+                    getattr(args, "camera_id", None),
+                    session_started_at,
                 )
                 if args.output:
                     write_result_file(result, args.output)
@@ -984,12 +1510,25 @@ def run_camera_monitor(args):
                 audio_worker.stop()
             except Exception as exc:
                 LOGGER.warning("Could not stop realtime audio cleanly: %s", exc)
+        if conversation_worker is not None:
+            conversation_worker.stop()
+            drain_conversation_results(
+                conversation_worker,
+                tts_worker,
+                conversation_persistence_worker,
+            )
+        if conversation_persistence_worker is not None:
+            conversation_persistence_worker.stop()
+            drain_conversation_persistence_results(conversation_persistence_worker)
+        if activity_persistence_worker is not None:
+            activity_persistence_worker.stop()
+            drain_activity_persistence_results(activity_persistence_worker)
         if ingestion_worker is not None:
             ingestion_worker.stop()
             drain_ingestion_results(ingestion_worker)
-        if conversation_worker is not None:
-            conversation_worker.stop()
-            drain_conversation_results(conversation_worker)
+        if tts_worker is not None:
+            tts_worker.stop()
+            drain_tts_results(tts_worker)
         source.release()
         try:
             cv2.destroyAllWindows()
